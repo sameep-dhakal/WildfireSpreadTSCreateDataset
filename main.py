@@ -1,53 +1,70 @@
 import ee
 import yaml
 import tqdm
+import os
+import time
 
 from DataPreparation.DatasetPrepareService import DatasetPrepareService
 
-if __name__ == '__main__':
+# === Configuration ===
+KEY_FILE = '/Users/sameeps/Documents/Dr-Malof/WIldfire/WildfireSpreadTSCreateDataset/abc.json'
+SERVICE_ACCOUNT = 'yourname@serviceaccount.iam.gserviceaccount.com'
+CONFIG_FOLDER = "config"
+N_BUFFER_DAYS = 4
+MAX_QUEUE = 2900
+QUEUE_CHECK_INTERVAL = 60  # in seconds
 
-    # TODO: Enter your desired config file path here. If you just want to recreate the results from the paper, 
-    # use the config files in the config folder to download the data belonging to the specified year. 
-    with open("config/us_fire_2021_1e7.yml", "r", encoding="utf8") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+# === GEE Auth ===
+credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
+ee.Initialize(credentials)
 
-    # TODO: Enter your gcloud key file path here.
-    key_file = 'your_gcloud_key_file.json'
+def wait_for_available_task_slot():
+    """Wait until Earth Engine task queue has room."""
+    while True:
+        task_list = ee.data.getTaskList()
+        running_or_ready = [t for t in task_list if t['state'] in ('READY', 'RUNNING')]
+        if len(running_or_ready) < MAX_QUEUE:
+            return
+        print(f"🕒 Task queue full ({len(running_or_ready)} tasks). Waiting {QUEUE_CHECK_INTERVAL}s...")
+        time.sleep(QUEUE_CHECK_INTERVAL)
 
-    # TODO: Enter your gcloud service account here.
-    service_account = 'yourname@yourbucket.iam.gserviceaccount.com'
-    credentials = ee.ServiceAccountCredentials(service_account, key_file)
-    ee.Initialize(credentials)
-
-    # Number of days to extract additionally, before and after the fire dates given in GlobFire. 
-    # If we want to perform multi-temporal modeling, e.g. with five days of input data, based on which we want to
-    # predict the fire occurrence on the sixth day, we need to add four days before the first fire occurrence. This way,
-    # we can predict the fire spread right on the day after the fire first appears. Alternatively, the preceding input 
-    # data could of course be set to zero. However, in a real-world scenario, we would *always* have preceding data,
-    # so we choose to model it this way here. Similarly, we want the last fire date to be able to take every position
-    # in the input data, so we add four days after the last fire date, to 'push out' the last fire date.
-    N_BUFFER_DAYS = 4
-
-    # Extract fire names from config file.
-    fire_names = list(config.keys())
-    for non_fire_key in ["output_bucket", "rectangular_size", "year"]:
-        fire_names.remove(non_fire_key)
-    locations = fire_names
-
-    # Keep track of any failures happening, to be able to manually re-run these later.
-    # Shouldn't happen, but if it does, we get to know about it.
-    failed_locations = []
-
-    # Tell Google Earth Engine to compute the images and add them to the specified google cloud bucket.
-    for location in tqdm.tqdm(locations):
-        print(f"Failed locations so far: {failed_locations}")
+def run_fire_task(location, config):
+    """Submit GEE task for one fire, retrying if necessary."""
+    while True:
+        wait_for_available_task_slot()
         dataset_pre = DatasetPrepareService(location=location, config=config)
-        print("Current Location:" + location)
-
         try:
             dataset_pre.extract_dataset_from_gee_to_gcloud('32610', n_buffer_days=N_BUFFER_DAYS)
-            # Uncomment to download data from gcloud to the local machine right away. Alternatively, you can use the
-            # gcloud command line tool to download the whole dataset at once after this script is done. 
             dataset_pre.download_data_from_gcloud_to_local()
-        except:
-            failed_locations.append(location)
+            return  # Success
+        except Exception as e:
+            print(f"❌ Retrying {location} due to error:\n{e}")
+            time.sleep(5)
+
+# === Main loop ===
+if __name__ == '__main__':
+    all_failed_locations = []
+
+    config_files = sorted([
+        f for f in os.listdir(CONFIG_FOLDER)
+        if f.endswith(".yml") or f.endswith(".yaml")
+    ])
+
+    for config_file in config_files:
+        config_path = os.path.join(CONFIG_FOLDER, config_file)
+        print(f"\n🚀 Processing config file: {config_path}")
+
+        with open(config_path, "r", encoding="utf8") as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+
+        fire_names = list(config.keys())
+        for skip_key in ["output_bucket", "rectangular_size", "year"]:
+            fire_names = [f for f in fire_names if f != skip_key]
+
+        for fire_id in tqdm.tqdm(fire_names, desc=f"🔥 Fires in {config_file}"):
+            print(f"\n🔁 Starting: {fire_id}")
+            run_fire_task(fire_id, config)
+
+        print(f"✅ Finished all fires in {config_file}")
+
+    print("\n🎉 All config files processed successfully.")
