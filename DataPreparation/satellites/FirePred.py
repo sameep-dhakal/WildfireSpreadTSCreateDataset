@@ -19,7 +19,8 @@ class FirePred:
         # VIIRS surface reflectance
         self.viirs = ee.ImageCollection('NOAA/VIIRS/001/VNP09GA')
         # VIIRS active fire product
-        self.viirs_af = ee.FeatureCollection('projects/grand-drive-285514/assets/afall')
+        # this is the file downloaded from archive Fire Archive
+        self.viirs_af = ee.FeatureCollection('projects/decoded/assets/fire')
         # VIIRS vegetation index
         self.viirs_veg_idx = ee.ImageCollection("NOAA/VIIRS/001/VNP13A1")
 
@@ -98,10 +99,20 @@ class FirePred:
             geometry).select('LC_Type1').median()
 
         # Turn acq_time (String) into acq_hour (int)
-        def add_acq_hour(feature):
+        # def add_acq_hour(feature):
+        #     acq_time_str = ee.String(feature.get("acq_time"))
+        #     acq_time_int = ee.Number.parse(acq_time_str)
+        #     return feature.set({"acq_hour": acq_time_int})
+
+        # ading the acq_hour along witth fire brightness 
+        def add_acq_hour_and_brightness(feature):
             acq_time_str = ee.String(feature.get("acq_time"))
             acq_time_int = ee.Number.parse(acq_time_str)
-            return feature.set({"acq_hour": acq_time_int})
+            brightness = feature.get("brightness")
+            return feature.set({
+                "acq_hour": acq_time_int,
+                "rawfire": brightness
+            })
 
         # VIIRS IMG and AF product
         viirs_img = self.viirs.filterDate(start_time, end_time).filterBounds(geometry).select(
@@ -113,14 +124,29 @@ class FirePred:
 
         # VIIRS AF consists only of points, so we need to turn them into a raster image.
         # We also filter out low confidence detections, since they are most likely false positives. 
-        viirs_af_img = self.viirs_af.map(add_acq_hour).filterBounds(geometry) \
+        # viirs_af_img = self.viirs_af.map(add_acq_hour_and_brightness).filterBounds(geometry) \
+        #     .filter(ee.Filter.gte('acq_date', start_time[:-6])) \
+        #     .filter(ee.Filter.lt('acq_date', (
+        #         datetime.datetime.strptime(end_time[:-6], '%Y-%m-%d') + datetime.timedelta(1)).strftime(
+        #     '%Y-%m-%d'))) \
+        #     .filter(ee.Filter.neq('confidence', 'l')).map(self.get_buffer) \
+        #     .reduceToImage(['acq_hour', 'rawfire'], ee.Reducer.last()) \
+        #     .rename(['active fire','rawfire'])
+
+
+        viirs_af_features = self.viirs_af.map(add_acq_hour_and_brightness).filterBounds(geometry) \
             .filter(ee.Filter.gte('acq_date', start_time[:-6])) \
             .filter(ee.Filter.lt('acq_date', (
                 datetime.datetime.strptime(end_time[:-6], '%Y-%m-%d') + datetime.timedelta(1)).strftime(
             '%Y-%m-%d'))) \
-            .filter(ee.Filter.neq('confidence', 'l')).map(self.get_buffer) \
-            .reduceToImage(['acq_hour'], ee.Reducer.last()) \
-            .rename(['active fire'])
+            .filter(ee.Filter.neq('confidence', 'l')).map(self.get_buffer)
+
+        viirs_af_hour = viirs_af_features.reduceToImage(['acq_hour'], ee.Reducer.last()).rename('active fire')
+        viirs_af_bright = viirs_af_features.reduceToImage(['rawfire'], ee.Reducer.last()).rename('rawfire')
+
+        viirs_af_img = viirs_af_hour.addBands(viirs_af_bright)
+        
+        # print("VIIRS AF Image: ", viirs_af_img.getInfo())
 
         return ee.ImageCollection(ee.Image(
             [viirs_img, viirs_veg_idc, precipitation, wind_velocity, wind_direction, temperature_min, temperature_max,
